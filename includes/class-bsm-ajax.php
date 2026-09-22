@@ -27,6 +27,12 @@ class BSM_Ajax {
 	const SKIP_TYPES      = array( 'tab', 'accordion', 'message' ); // Visual-only, never real data.
 	const FILL_ROLES      = array( 'title', 'description', 'image', 'link' ); // What "fill from post" can map into.
 
+	// Sentinel used when an Image field's raw value is a bare URL we can't map back to an
+	// attachment ID (Return Format = "Image URL" on a value ACF didn't store as an ID). Round-tripped
+	// through the hidden input instead of an id, so a save-with-no-edit can recognize it and leave
+	// the field's stored value alone rather than overwriting it with empty. See normalize_image().
+	const IMAGE_UNRESOLVED_MARKER = '__bsm_image_unresolved__';
+
 	public static function init() {
 		add_action( 'wp_ajax_bsm_get_post_types', array( __CLASS__, 'get_post_types' ) );
 		add_action( 'wp_ajax_bsm_search_items', array( __CLASS__, 'search_items' ) );
@@ -38,6 +44,20 @@ class BSM_Ajax {
 		add_action( 'wp_ajax_bsm_discard_generated_images', array( __CLASS__, 'discard_generated_images' ) );
 		add_action( 'wp_ajax_bsm_get_source_mapping', array( __CLASS__, 'get_source_mapping' ) );
 		add_action( 'wp_ajax_bsm_save_source_mapping', array( __CLASS__, 'save_source_mapping' ) );
+		add_action( 'bsm_cleanup_generated_images', array( __CLASS__, 'cleanup_orphaned_generated_images' ) );
+	}
+
+	/**
+	 * True for a field type/settings combo this tool can actually round-trip. A multi-select
+	 * dropdown is excluded even though 'select' is otherwise editable — the UI only has a
+	 * single-value <select>, so editing one would silently drop every selection but the first
+	 * (see DEF-04). Until multi-select has real support, treat it like Gallery: listed, but
+	 * never written to.
+	 */
+	public static function is_field_supported( $f ) {
+		if ( ! in_array( $f['type'], self::EDITABLE_TYPES, true ) ) return false;
+		if ( 'select' === $f['type'] && ! empty( $f['multiple'] ) ) return false;
+		return true;
 	}
 
 	private static function check() {
@@ -146,14 +166,7 @@ class BSM_Ajax {
 		wp_send_json_success( array( 'fields' => $out ) );
 	}
 
-	/**
-	 * Builds the Step-3 list — top-level fields only. A Group field shows as a single
-	 * card, same as a Repeater or Flexible Content field; its own sub-fields (including
-	 * any container nested inside it) only appear once you actually pick it and open its
-	 * form, via Browse → for anything that's itself a container. Nothing here is
-	 * flattened in ahead of time, so the list a page shows always matches its real
-	 * top-level structure, no matter how many fields a Group holds.
-	 */
+	/** Builds the Step-3 list — every top-level field in the group, with a live count/preview for containers. */
 	private static function collect_field_rows( $fields, $post_id ) {
 		$out = array();
 
@@ -162,12 +175,15 @@ class BSM_Ajax {
 
 			// $f is already this field's real definition (from acf_get_fields()), so pass it
 			// straight in as the known-good fallback — no need to re-discover it if
-			// get_field_object() can't resolve it on its own (see get_field_data()).
-			$obj = self::get_field_data( $f['name'], $post_id, $f );
+			// get_field_object() can't resolve it on its own (see get_field_data()). Its 'key' is
+			// passed too so the lookup is pinned to THIS exact field, not just anything with a
+			// matching name on the post — see DEF-07 and get_field_data()'s docblock.
+			$obj = self::get_field_data( $f['name'], $post_id, $f, $f['key'] ?? null );
 			if ( ! $obj ) continue; // Only happens if the field has genuinely vanished from ACF entirely.
 
 			$row = array(
 				'name'  => $f['name'],
+				'key'   => $f['key'] ?? '',
 				'label' => $f['label'],
 				'type'  => $f['type'],
 			);
@@ -192,7 +208,7 @@ class BSM_Ajax {
 				$out[] = $row;
 			} else {
 				$row['is_container'] = false;
-				$row['supported']    = in_array( $f['type'], self::EDITABLE_TYPES, true );
+				$row['supported']    = self::is_field_supported( $f );
 				$out[] = $row;
 			}
 		}
@@ -268,16 +284,103 @@ class BSM_Ajax {
 	 * group technically saved, but ACF's own post-context lookup hasn't caught up), regardless of
 	 * whether the field currently holds a value or is completely empty. $known_def, if passed, is
 	 * trusted as-is (the caller already has it from acf_get_fields()) instead of being re-found.
+	 *
+	 * $format_value is deliberately false: we want the RAW stored value (Ymd for a date, the
+	 * option key for a select, the attachment ID for an image, unwrapped HTML for a wysiwyg —
+	 * whatever update_field() itself would accept back), not ACF's display-formatted output. A
+	 * value round-tripped from the formatted output is a different value than what's actually
+	 * stored, so saving a slot with no real edits would silently rewrite the field (wrong date,
+	 * wrong dropdown option, wysiwyg text wrapped in extra <p> tags, etc.) — see DEF-02/03/05.
+	 *
+	 * $field_key, when the caller has it, is what we actually resolve by. An ACF field KEY
+	 * ('field_xxxxxxxxxxxxx') belongs to exactly one field in exactly one field group; a field
+	 * NAME does not — two different field groups attached to the very same post can both define
+	 * their own field called e.g. "headline". Resolving by name alone (what get_field_object() and
+	 * get_field() fall back to) reads a `_<name>` reference meta on the post that only points at
+	 * whichever group's metabox saved that name most recently — a completely different field than
+	 * the one the user actually picked in Step 2/3 might come back. See DEF-07.
 	 */
-	public static function get_field_data( $field_name, $post_id, $known_def = null ) {
-		$obj = get_field_object( $field_name, $post_id, true, true );
-		if ( $obj ) return $obj;
+	public static function get_field_data( $field_name, $post_id, $known_def = null, $field_key = null ) {
+		$obj = get_field_object( $field_key ?: $field_name, $post_id, false, true );
+		if ( ! $obj ) {
+			$def = $known_def ?: self::find_field_definition( $field_name, $post_id );
+			if ( ! $def ) return null; // Genuinely doesn't exist on this post's field groups at all.
 
-		$def = $known_def ?: self::find_field_definition( $field_name, $post_id );
-		if ( ! $def ) return null; // Genuinely doesn't exist on this post's field groups at all.
+			$def['value'] = get_field( $field_key ?: $field_name, $post_id, false );
+			$obj = $def;
+		}
 
-		$def['value'] = get_field( $field_name, $post_id, true );
-		return $def;
+		$obj['value'] = self::normalize_raw_value( $obj['value'], $obj );
+		return $obj;
+	}
+
+	/**
+	 * With $format_value=false (what get_field_data() always uses — see its docblock on why),
+	 * ACF hands back a Group's/Repeater row's/Flexible-Content row's value keyed by each
+	 * sub-field's KEY ('field_xxxxxxxxxxxxx'), NOT by its name — confirmed directly in ACF core's
+	 * own load_value() for those field types (class-acf-field-group.php, class-acf-field-repeater.php,
+	 * class-acf-field-flexible-content.php): the NAME-keyed shape only exists after format_value()
+	 * runs, which this plugin deliberately skips.
+	 *
+	 * Every other part of this plugin (resolve_path(), describe_subfields(), values_for_schema(),
+	 * merge_row(), build_preview()/build_preview_flex()) indexes these arrays by NAME. Left
+	 * unfixed, that mismatch means:
+	 *   - every field living inside a Group/Repeater/Flexible-Content row reads back BLANK in
+	 *     this tool no matter what's actually stored, and
+	 *   - saving one is worse than a no-op: merge_row() adds the new value under the sub-field's
+	 *     NAME onto a row that still carries its old value under the sub-field's KEY, and ACF's
+	 *     own Group::update_value()/Repeater::update_value() check the KEY-keyed entry BEFORE the
+	 *     NAME-keyed one — so the untouched OLD value silently wins and gets re-saved over
+	 *     whatever was just typed, on every single save.
+	 *
+	 * This walks $value against $field's own sub-field definitions and rewrites every key-keyed
+	 * entry to its sub-field's name, recursing into any nested group/repeater/flexible_content —
+	 * structural only, no value formatting (unlike ACF's own format_value()) — so the result stays
+	 * a faithful, update_field()-safe raw value, just correctly keyed the way the rest of this
+	 * plugin already assumes.
+	 */
+	private static function normalize_raw_value( $value, $field ) {
+		if ( ! is_array( $value ) ) return $value;
+
+		switch ( $field['type'] ?? '' ) {
+			case 'group':
+				return self::rekey_by_name( $value, $field['sub_fields'] ?? array() );
+
+			case 'repeater':
+				return array_map( function ( $row ) use ( $field ) {
+					return self::rekey_by_name( $row, $field['sub_fields'] ?? array() );
+				}, $value );
+
+			case 'flexible_content':
+				return array_map( function ( $row ) use ( $field ) {
+					$layout_def = self::find_layout_def( $field['layouts'] ?? array(), $row['acf_fc_layout'] ?? '' );
+					$rekeyed    = $layout_def ? self::rekey_by_name( $row, $layout_def['sub_fields'] ) : $row;
+					$rekeyed['acf_fc_layout'] = $row['acf_fc_layout'] ?? '';
+					return $rekeyed;
+				}, $value );
+
+			default:
+				return $value;
+		}
+	}
+
+	/** Does the actual key->name rewrite for one group/row, recursing into nested containers. See normalize_raw_value(). */
+	private static function rekey_by_name( $value, $sub_fields ) {
+		if ( ! is_array( $value ) || empty( $sub_fields ) ) return $value;
+
+		$out = array();
+		foreach ( $sub_fields as $sf ) {
+			if ( array_key_exists( $sf['key'], $value ) ) {
+				$raw = $value[ $sf['key'] ];
+			} elseif ( array_key_exists( $sf['name'], $value ) ) {
+				$raw = $value[ $sf['name'] ]; // Already name-keyed (e.g. came from get_field() fallback) — leave as-is.
+			} else {
+				continue; // Never saved — nothing to carry over.
+			}
+
+			$out[ $sf['name'] ] = self::normalize_raw_value( $raw, $sf );
+		}
+		return $out;
 	}
 
 	/** Finds a field's own definition by scanning this post's field groups directly (see get_field_data()). */
@@ -309,9 +412,10 @@ class BSM_Ajax {
 
 	/**
 	 * Reads $_POST['path'], a JSON-encoded array of hops:
-	 *   [ { "name": "testimonials", "row": 2 }, { "name": "sub_items", "row": 0 }, ... ]
-	 * The first hop's name is always a real top-level ACF field name.
-	 * Every later hop names a sub-field of whatever container the previous
+	 *   [ { "name": "testimonials", "key": "field_abc123", "row": 2 }, { "name": "sub_items", "row": 0 }, ... ]
+	 * The first hop's name is always a real top-level ACF field name, and its "key" (when the
+	 * client has it) is what actually resolves it — see get_field_data() and DEF-07 for why name
+	 * alone isn't reliable. Every later hop names a sub-field of whatever container the previous
 	 * hop resolved to. "row" is the chosen repeater/flexible-content row
 	 * index, or null/omitted for a Group hop (or a container not yet
 	 * drilled into a specific row).
@@ -325,6 +429,10 @@ class BSM_Ajax {
 			if ( ! is_array( $hop ) || empty( $hop['name'] ) ) return null;
 			$path[] = array(
 				'name'   => sanitize_text_field( $hop['name'] ),
+				// The field key, when the client has it — used to resolve the ROOT hop by key
+				// instead of by name, so two field groups on the same post with a same-named field
+				// can't get crossed. See get_field_data() and DEF-07.
+				'key'    => ! empty( $hop['key'] ) ? sanitize_text_field( $hop['key'] ) : null,
 				'row'    => ( isset( $hop['row'] ) && '' !== $hop['row'] && null !== $hop['row'] ) ? absint( $hop['row'] ) : null,
 				'layout' => ! empty( $hop['layout'] ) ? sanitize_text_field( $hop['layout'] ) : null,
 			);
@@ -351,7 +459,9 @@ class BSM_Ajax {
 	 *   choices    - choices list, for a leaf select field.
 	 *   is_new     - true if the final hop's row index doesn't exist yet
 	 *                (i.e. this is a not-yet-saved "add new" slot).
-	 *   root_name  - the top-level field name (what update_field() targets).
+	 *   root_name  - the top-level field name.
+	 *   root_key   - the top-level field's own ACF key, when resolvable — what update_field()
+	 *                actually targets (falls back to root_name only if a key never resolved).
 	 *   root_value - the full current value of the root field, untouched
 	 *                siblings included.
 	 *   key_path   - ordered array keys from root_value down to `value`,
@@ -362,7 +472,8 @@ class BSM_Ajax {
 		if ( empty( $path ) ) return null;
 
 		$root_name = $path[0]['name'];
-		$obj = self::get_field_data( $root_name, $post_id );
+		$root_key  = $path[0]['key'] ?? null;
+		$obj = self::get_field_data( $root_name, $post_id, null, $root_key );
 		if ( ! $obj ) return null;
 
 		$root_value = $obj['value'];
@@ -372,6 +483,7 @@ class BSM_Ajax {
 		$layouts    = $obj['layouts'] ?? array();
 		$label      = $obj['label'];
 		$choices    = $obj['choices'] ?? null;
+		$multiple   = $obj['multiple'] ?? false;
 		$value      = $root_value;
 		$key_path   = array();
 		$is_new     = false;
@@ -392,6 +504,7 @@ class BSM_Ajax {
 				$layouts    = $sub_def['layouts'] ?? array();
 				$label      = $sub_def['label'];
 				$choices    = $sub_def['choices'] ?? null;
+				$multiple   = $sub_def['multiple'] ?? false;
 			}
 
 			$is_new = false;
@@ -399,13 +512,18 @@ class BSM_Ajax {
 			if ( null === $row ) continue;
 
 			if ( 'repeater' === $type ) {
-				$rows       = is_array( $value ) ? $value : array();
+				$rows = is_array( $value ) ? $value : array();
+				// Row index must land on an existing row, or exactly the next available slot (an
+				// "Add New Row") — anything further out (a tampered request) is rejected rather than
+				// silently accepted, which is what let ACF pad the gap with an unwanted extra row. See DEF-08.
+				if ( $row > count( $rows ) ) return null;
 				$is_new     = ! isset( $rows[ $row ] );
 				$key_path[] = $row;
 				$value      = $rows[ $row ] ?? array();
 				$type       = '__row__';
 			} elseif ( 'flexible_content' === $type ) {
-				$rows        = is_array( $value ) ? $value : array();
+				$rows = is_array( $value ) ? $value : array();
+				if ( $row > count( $rows ) ) return null; // See DEF-08 note above.
 				$is_new      = ! isset( $rows[ $row ] );
 				$existing    = $rows[ $row ] ?? array();
 				$layout_name = $existing['acf_fc_layout'] ?? ( $hop['layout'] ?? '' );
@@ -428,8 +546,13 @@ class BSM_Ajax {
 			'value'      => $value,
 			'label'      => $label,
 			'choices'    => $choices,
+			'multiple'   => $multiple,
 			'is_new'     => $is_new,
 			'root_name'  => $root_name,
+			// The ACTUAL resolved root field's own key (not just whatever key the client happened
+			// to send) — saving through this instead of the bare name keeps the write pinned to
+			// the exact field that was read, closing the same name-collision gap as the read side.
+			'root_key'   => $obj['key'] ?? null,
 			'root_value' => $root_value,
 			'key_path'   => $key_path,
 		);
@@ -453,6 +576,7 @@ class BSM_Ajax {
 
 	public static function get_slot() {
 		self::check();
+		if ( ! function_exists( 'get_field_object' ) ) wp_send_json_error( array( 'message' => 'ACF is not active.' ) );
 
 		$post_id = absint( $_POST['post_id'] ?? 0 );
 		$path    = self::parse_path( $_POST['path'] ?? '' );
@@ -495,7 +619,7 @@ class BSM_Ajax {
 				'name'         => $leaf_name,
 				'label'        => $node['label'],
 				'type'         => $node['type'],
-				'supported'    => in_array( $node['type'], self::EDITABLE_TYPES, true ),
+				'supported'    => self::is_field_supported( array( 'type' => $node['type'], 'multiple' => $node['multiple'] ?? false ) ),
 				'choices'      => $node['choices'],
 				'is_container' => false,
 			) );
@@ -524,7 +648,7 @@ class BSM_Ajax {
 				'name'      => $sf['name'],
 				'label'     => $sf['label'],
 				'type'      => $sf['type'],
-				'supported' => in_array( $sf['type'], self::EDITABLE_TYPES, true ),
+				'supported' => self::is_field_supported( $sf ),
 				'choices'   => $sf['choices'] ?? null,
 			);
 
@@ -570,11 +694,23 @@ class BSM_Ajax {
 		return $out;
 	}
 
+	/**
+	 * $val is normally already the raw attachment ID (get_field_data() now reads unformatted
+	 * values — see its docblock), so the numeric branch is what fires in practice. The string
+	 * branch is a fallback for a value that isn't an ID (e.g. legacy data literally stored as a
+	 * URL): we try to resolve it to a real attachment, and if we can't, we hand back a sentinel
+	 * id instead of an empty one, so a save-with-no-edit doesn't wipe the field (see DEF-01 and
+	 * save_slot()/merge_row()'s handling of IMAGE_UNRESOLVED_MARKER).
+	 */
 	private static function normalize_image( $val ) {
 		if ( empty( $val ) ) return array( 'id' => '', 'url' => '' );
 		if ( is_array( $val ) ) return array( 'id' => $val['ID'] ?? ( $val['id'] ?? '' ), 'url' => $val['sizes']['medium'] ?? ( $val['url'] ?? '' ) );
 		if ( is_numeric( $val ) ) return array( 'id' => $val, 'url' => wp_get_attachment_image_url( $val, 'medium' ) ?: '' );
-		if ( is_string( $val ) ) return array( 'id' => '', 'url' => $val ); // URL-only return format, can't recover an ID.
+		if ( is_string( $val ) ) {
+			$resolved = attachment_url_to_postid( $val );
+			if ( $resolved ) return array( 'id' => $resolved, 'url' => wp_get_attachment_image_url( $resolved, 'medium' ) ?: $val );
+			return array( 'id' => self::IMAGE_UNRESOLVED_MARKER, 'url' => $val );
+		}
 		return array( 'id' => '', 'url' => '' );
 	}
 
@@ -585,6 +721,7 @@ class BSM_Ajax {
 
 	public static function fill_from_post() {
 		self::check();
+		if ( ! function_exists( 'get_field_object' ) ) wp_send_json_error( array( 'message' => 'ACF is not active.' ) );
 
 		$path           = self::parse_path( $_POST['path'] ?? '' );
 		$source_post_id = absint( $_POST['source_post_id'] ?? 0 );
@@ -932,8 +1069,54 @@ class BSM_Ajax {
 		$metadata = wp_generate_attachment_metadata( $attach_id, $saved['path'] );
 		wp_update_attachment_metadata( $attach_id, $metadata );
 		update_post_meta( $attach_id, '_bsm_generated', 1 );
+		// Pending-cleanup marker — cleared by confirm_generated_image() the moment this copy is
+		// actually saved into a slot. Anything still carrying this a day later was abandoned (tab
+		// closed, browser crashed, etc. — the JS-side cleanup never got to run) and is swept up by
+		// cleanup_orphaned_generated_images(). See DEF-10.
+		update_post_meta( $attach_id, '_bsm_generated_at', time() );
 
 		return $attach_id;
+	}
+
+	/**
+	 * Marks a generated image copy as "actually in use" once it's confirmed into a save, so the
+	 * scheduled cleanup (see DEF-10) never touches it. A no-op for anything that isn't a pending
+	 * generated copy (a manually-picked image, an ordinary un-generated attachment, etc.).
+	 */
+	private static function confirm_generated_image( $attachment_id ) {
+		$attachment_id = (int) $attachment_id;
+		if ( $attachment_id && get_post_meta( $attachment_id, '_bsm_generated_at', true ) ) {
+			delete_post_meta( $attachment_id, '_bsm_generated_at' );
+		}
+	}
+
+	/**
+	 * Scheduled daily (see blog-slot-manager.php) — deletes any plugin-generated image copy
+	 * (see create_resized_copy()) still carrying its pending-cleanup marker a day after it was
+	 * made. A copy only keeps that marker if it was never actually saved into a slot AND never
+	 * cleaned up client-side (Cancel, Back, filling again) — i.e. exactly the "closed the tab
+	 * mid-fill" case in DEF-10. Never touches a real blog post's featured image or a manually
+	 * picked Media Library image — neither is ever tagged `_bsm_generated_at`.
+	 */
+	public static function cleanup_orphaned_generated_images() {
+		$stale = get_posts( array(
+			'post_type'      => 'attachment',
+			'post_status'    => 'inherit',
+			'posts_per_page' => 200,
+			'fields'         => 'ids',
+			'meta_query'     => array(
+				array(
+					'key'     => '_bsm_generated_at',
+					'value'   => time() - DAY_IN_SECONDS,
+					'compare' => '<',
+					'type'    => 'NUMERIC',
+				),
+			),
+		) );
+
+		foreach ( $stale as $attachment_id ) {
+			wp_delete_attachment( $attachment_id, true );
+		}
 	}
 
 	/**
@@ -984,6 +1167,9 @@ class BSM_Ajax {
 
 	public static function save_slot() {
 		self::check();
+		if ( ! function_exists( 'get_field_object' ) || ! function_exists( 'update_field' ) ) {
+			wp_send_json_error( array( 'message' => 'ACF is not active.' ) );
+		}
 
 		$post_id = absint( $_POST['post_id'] ?? 0 );
 		$path    = self::parse_path( $_POST['path'] ?? '' );
@@ -1009,14 +1195,24 @@ class BSM_Ajax {
 		} else {
 			// Leaf scalar field.
 			$leaf_name = end( $path )['name'];
-			$new_value = self::cast_value( $node['type'], $values[ $leaf_name ] ?? '' );
-			if ( 'image' === $node['type'] ) {
-				self::maybe_delete_replaced_generated_image( $node['value'], $new_value );
+			$incoming  = $values[ $leaf_name ] ?? '';
+			if ( 'image' === $node['type'] && self::IMAGE_UNRESOLVED_MARKER === $incoming ) {
+				// Couldn't resolve this image's attachment ID on load (see normalize_image()) and
+				// it wasn't replaced — keep whatever is already stored instead of blanking it out.
+				$new_value = $node['value'];
+			} else {
+				$new_value = self::cast_value( $node['type'], $incoming, $node['choices'] ?? null );
+				if ( null === $new_value ) {
+					$new_value = $node['value']; // Not one of this select's own choices — keep what was stored. See DEF-09.
+				} elseif ( 'image' === $node['type'] ) {
+					self::maybe_delete_replaced_generated_image( $node['value'], $new_value );
+					self::confirm_generated_image( $new_value );
+				}
 			}
 		}
 
 		$root_value = self::set_by_key_path( $node['root_value'], $node['key_path'], $new_value );
-		update_field( $node['root_name'], $root_value, $post_id );
+		update_field( $node['root_key'] ?: $node['root_name'], $root_value, $post_id );
 
 		// NOTE: update_field()'s return value is deliberately ignored here. For a repeater or
 		// flexible_content field, ACF's own update_value() writes each sub-field's data via its
@@ -1043,11 +1239,19 @@ class BSM_Ajax {
 		$row = is_array( $existing ) ? $existing : array();
 		foreach ( $schema as $sf ) {
 			if ( ! $sf['supported'] ) continue; // Preserve whatever was already there.
-			$key     = $sf['name'];
-			$new_val = self::cast_value( $sf['type'], $incoming_values[ $key ] ?? '' );
+			$key      = $sf['name'];
+			$incoming = $incoming_values[ $key ] ?? '';
+
+			if ( 'image' === $sf['type'] && self::IMAGE_UNRESOLVED_MARKER === $incoming ) {
+				continue; // Unresolved on load and not replaced — leave this sub-field's value untouched.
+			}
+
+			$new_val = self::cast_value( $sf['type'], $incoming, $sf['choices'] ?? null );
+			if ( null === $new_val ) continue; // Not one of this select's own choices — leave it as it was. See DEF-09.
 
 			if ( 'image' === $sf['type'] ) {
 				self::maybe_delete_replaced_generated_image( $existing[ $key ] ?? null, $new_val );
+				self::confirm_generated_image( $new_val );
 			}
 
 			$row[ $key ] = $new_val;
@@ -1055,7 +1259,23 @@ class BSM_Ajax {
 		return $row;
 	}
 
-	public static function cast_value( $type, $val ) {
+	/**
+	 * $choices, for a 'select' field, is that field's own live choices list (value => label). A
+	 * submitted value that isn't one of those keys isn't a real selection — the dropdown the user
+	 * was actually shown could never have produced it — so it's rejected (null) rather than stored
+	 * as-is, which is what previously let a hand-crafted request set a select field to any
+	 * arbitrary string. The caller treats null as "leave the existing value alone", same as an
+	 * unresolved image. See DEF-09.
+	 */
+	/**
+	 * $force_empty bypasses everything else, including select's choice check, and returns this
+	 * type's own notion of "empty" — used by the import "clear this field" flag (BSM_Import_Export),
+	 * which means "make it blank" even when blank isn't technically one of a select's own choices.
+	 */
+	public static function cast_value( $type, $val, $choices = null, $force_empty = false ) {
+		if ( $force_empty ) {
+			return 'true_false' === $type ? 0 : '';
+		}
 		switch ( $type ) {
 			case 'image':
 				return $val === '' ? '' : absint( $val );
@@ -1071,8 +1291,11 @@ class BSM_Ajax {
 				return wp_kses_post( wp_unslash( (string) $val ) );
 			case 'textarea':
 				return sanitize_textarea_field( wp_unslash( (string) $val ) );
-			case 'text':
 			case 'select':
+				$val = sanitize_text_field( wp_unslash( (string) $val ) );
+				if ( is_array( $choices ) && ! array_key_exists( $val, $choices ) ) return null;
+				return $val;
+			case 'text':
 			case 'date_picker':
 			default:
 				return sanitize_text_field( wp_unslash( (string) $val ) );

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Field Manager
  * Description: Browse Page -> ACF Field Group -> Field -> Slot, see current values live, and replace them — no pre-configuration needed. Reads your ACF structure fresh every time.
- * Version: 2.5.2
+ * Version: 2.6.0
  * Author: Custom Build
  * Requires PHP: 7.4
  *
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // No direct access.
 }
 
-define( 'BSM_VERSION', '2.5.2' );
+define( 'BSM_VERSION', '2.6.0' );
 define( 'BSM_PATH', plugin_dir_path( __FILE__ ) );
 define( 'BSM_URL', plugin_dir_url( __FILE__ ) );
 
@@ -29,6 +29,19 @@ add_action( 'admin_init', function () {
 
 require_once BSM_PATH . 'includes/class-bsm-dashboard.php';
 require_once BSM_PATH . 'includes/class-bsm-ajax.php';
+require_once BSM_PATH . 'includes/class-bsm-import-export.php';
+
+// Daily sweep for "fill from post" image copies that were generated but never actually saved or
+// cleaned up client-side (e.g. the tab was closed mid-fill) — see DEF-10 and
+// BSM_Ajax::cleanup_orphaned_generated_images().
+register_activation_hook( __FILE__, function () {
+	if ( ! wp_next_scheduled( 'bsm_cleanup_generated_images' ) ) {
+		wp_schedule_event( time(), 'daily', 'bsm_cleanup_generated_images' );
+	}
+} );
+register_deactivation_hook( __FILE__, function () {
+	wp_clear_scheduled_hook( 'bsm_cleanup_generated_images' );
+} );
 
 /**
  * Boot the plugin.
@@ -50,6 +63,7 @@ final class Blog_Slot_Manager {
 
 		BSM_Dashboard::init();
 		BSM_Ajax::init();
+		BSM_Import_Export::init();
 	}
 
 	public function register_menu() {

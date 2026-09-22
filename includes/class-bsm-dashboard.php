@@ -43,7 +43,31 @@ class BSM_Dashboard {
 			<!-- Step 2: field group -->
 			<div class="bsm-panel" id="bsm-step-2" style="display:none;">
 				<h2>Step 2 — Choose an ACF Field Group</h2>
+
+				<div class="bsm-io-box">
+					<strong>Move data between pages or sites (test → live, etc.):</strong>
+					<p class="bsm-io-actions">
+						<button type="button" class="button" id="bsm-export-page">⬇ Export this page's data</button>
+						<button type="button" class="button" id="bsm-export-template">⬇ Download blank layout</button>
+						<button type="button" class="button" id="bsm-import-trigger">⬆ Import data onto this page</button>
+						<input type="file" id="bsm-import-file" accept="application/json" style="display:none;">
+					</p>
+					<p class="description">"This page" covers every field group attached to it. To export just one group, use the Export button on that group's own card below. Images are matched by filename against this site's own Media Library on import — if a matching file isn't found there, that image is left as-is rather than importing a broken reference.</p>
+				</div>
+
 				<div id="bsm-groups-area"><p class="description">Loading…</p></div>
+
+				<!-- Import review — nothing is written until Confirm Import is clicked. -->
+				<div class="bsm-import-review" id="bsm-import-review" style="display:none;">
+					<h3>Review import</h3>
+					<p class="description">Uncheck anything you don't want applied, then confirm.</p>
+					<div id="bsm-import-diff"></div>
+					<p class="bsm-actions">
+						<button type="button" class="button" id="bsm-import-cancel">Cancel</button>
+						<button type="button" class="button button-primary" id="bsm-import-confirm">Confirm Import</button>
+					</p>
+					<div id="bsm-import-result"></div>
+				</div>
 			</div>
 
 			<!-- Step 3: field within group -->

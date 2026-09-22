@@ -13,6 +13,7 @@
 		editBaseDepth: 0,  // state.path.length at the moment the edit panel was freshly opened from Step 4
 		currentSchema: [], // schema array behind the fields currently rendered, so nested-browse clicks can look sf up by index
 		pendingGeneratedImageIds: [], // "fill from post" image copies not yet saved — discarded if superseded or the editor closes without saving
+		importFileText: null, // raw text of the last uploaded export file — re-sent to bsm_commit_import as-is, never trusting the preview response for the actual write
 	};
 
 	/** Deletes any not-yet-saved "fill from post" image copies (server re-checks before actually deleting anything). */
@@ -78,7 +79,7 @@
 	/** The path as sent to the server — just the fields resolve_path() needs. */
 	function pathForServer() {
 		return state.path.map( function ( h ) {
-			return { name: h.name, row: h.row, layout: h.layout };
+			return { name: h.name, key: h.key, row: h.row, layout: h.layout };
 		} );
 	}
 
@@ -123,7 +124,11 @@
 
 		$el.off( 'change.bsm' ).on( 'change.bsm', function () {
 			var id = $( this ).val();
-			if ( id ) onChange( id, $( this ).find( ':selected' ).text() );
+			// Always fires, even when the picker is cleared (id is then '' /null) — callers need
+			// to know a selection was REMOVED, not just made, so they can reset whatever depended
+			// on it (see bindItemSelect()'s DEF-14 fix below: leaving this silent on clear is what
+			// let Step 2 keep showing the previous page's field groups after removing the page).
+			onChange( id || null, id ? $( this ).find( ':selected' ).text() : '' );
 		} );
 	}
 
@@ -154,6 +159,15 @@
 			function ( id, label ) {
 				state.postId = id;
 				state.postLabel = label;
+
+				if ( ! id ) {
+					// Page selection was cleared — hide everything downstream instead of leaving
+					// the previous page's field groups/fields/slots on screen. See DEF-14.
+					resetFrom( 1 );
+					setBreadcrumb( 1 );
+					return;
+				}
+
 				resetFrom( 2 );
 				$( '#bsm-step-2' ).show();
 				setBreadcrumb( 2 );
@@ -180,7 +194,10 @@
 			}
 			var html = '<div class="bsm-card-grid">';
 			data.groups.forEach( function ( g ) {
-				html += '<button type="button" class="bsm-card bsm-pick-group" data-key="' + escapeHtml( g.key ) + '" data-title="' + escapeHtml( g.title ) + '">' + escapeHtml( g.title ) + '</button>';
+				html += '<div class="bsm-card">';
+				html += '<div class="bsm-card-click bsm-pick-group" data-key="' + escapeHtml( g.key ) + '" data-title="' + escapeHtml( g.title ) + '">' + escapeHtml( g.title ) + '</div>';
+				html += '<button type="button" class="button-link bsm-group-export" data-key="' + escapeHtml( g.key ) + '" data-title="' + escapeHtml( g.title ) + '">⬇ Export this group</button>';
+				html += '</div>';
 			} );
 			html += '</div>';
 			$area.html( html );
@@ -228,7 +245,8 @@
 		$( this ).addClass( 'is-selected' );
 
 		var f = state.fieldsCache[ $( this ).data( 'index' ) ];
-		state.path = [ { name: f.name, label: f.label, type: f.type, row: null, layout: null } ];
+
+		state.path = [ { name: f.name, key: f.key, label: f.label, type: f.type, row: null, layout: null } ];
 
 		resetFrom( 4 );
 		$( '#bsm-step-4' ).show();
@@ -243,7 +261,7 @@
 	function slotCardHtml( row, index, layoutLabel ) {
 		var html = '<button type="button" class="bsm-card bsm-pick-slot" data-row="' + index + '">';
 		if ( row.thumb ) {
-			html += '<img src="' + row.thumb + '" alt="">';
+			html += '<img src="' + escapeHtml( row.thumb ) + '" alt="">';
 		} else {
 			html += '<div class="bsm-slot-noimg">No image</div>';
 		}
@@ -415,7 +433,7 @@
 				var inputType = { number: 'number', url: 'url', email: 'email' }[ sf.type ] || 'text';
 				var stepAttr = 'number' === sf.type ? ' step="any"' : '';
 				html += '<input type="' + inputType + '"' + stepAttr + ' data-field="' + escapeHtml( sf.name ) + '" value="' + escapeHtml( val.raw || '' ) + '">';
-				if ( 'date_picker' === sf.type ) html += '<p class="description">Plain text — match whatever date format is already used in this field.</p>';
+				if ( 'date_picker' === sf.type ) html += '<p class="description">Plain text — use YYYYMMDD (e.g. 20260911), the format ACF actually stores regardless of how this field displays it elsewhere.</p>';
 				if ( 'text' === sf.type ) html += formInserterHtml();
 			}
 
@@ -504,6 +522,8 @@
 			function () { return $( '#bsm-fill-post-type' ).val(); },
 			'Search posts to pull values from…',
 			function ( postId ) {
+				if ( ! postId ) return; // cleared the search box — nothing to fill from
+
 				if ( 'wpforms' === $( '#bsm-fill-post-type' ).val() ) {
 					applyFormShortcodeFill( postId );
 					return;
@@ -715,6 +735,183 @@
 			$( '#bsm-result-msg' ).html( '<p class="bsm-error">' + escapeHtml( msg ) + '</p>' );
 			$btn.text( 'Save Changes' ).prop( 'disabled', false );
 		} );
+	} );
+
+	/* ---------------- raw export (Step 2) — the fast path for anyone happy with a plain file ---------------- */
+
+	/** Triggers a browser download of $text as $filename — no server-side file is ever created. */
+	function downloadText( filename, text ) {
+		var blob = new Blob( [ text ], { type: 'application/json' } );
+		var url  = URL.createObjectURL( blob );
+		var $a   = $( '<a>' ).attr( { href: url, download: filename } ).appendTo( 'body' );
+		$a[ 0 ].click();
+		$a.remove();
+		setTimeout( function () { URL.revokeObjectURL( url ); }, 1000 );
+	}
+
+	function slugForFilename( text ) {
+		return ( text || 'export' ).toLowerCase().replace( /[^a-z0-9]+/g, '-' ).replace( /^-+|-+$/g, '' ) || 'export';
+	}
+
+	function doExport( groupKey, groupTitleForFilename ) {
+		var payload = { post_id: state.postId };
+		if ( groupKey ) payload.group_key = groupKey;
+		ajax( 'bsm_export_data', payload, function ( data ) {
+			var name = 'bsm_export_' + slugForFilename( state.postLabel ) + ( groupKey ? '_' + slugForFilename( groupTitleForFilename ) : '' ) + '.json';
+			downloadText( name, data.json );
+		} );
+	}
+
+	$( document ).on( 'click', '#bsm-export-page', function () {
+		doExport( null, null );
+	} );
+	$( document ).on( 'click', '.bsm-group-export', function () {
+		doExport( $( this ).data( 'key' ), $( this ).data( 'title' ) );
+	} );
+	$( document ).on( 'click', '#bsm-export-template', function () {
+		var payload = { post_id: state.postId };
+		ajax( 'bsm_export_template', payload, function ( data ) {
+			downloadText( 'bsm_template_' + slugForFilename( state.postLabel ) + '.json', data.json );
+		} );
+	} );
+
+	/* ---- import: upload -> preview/diff -> confirm ---- */
+
+	$( document ).on( 'click', '#bsm-import-trigger', function () {
+		$( '#bsm-import-file' ).val( '' ).trigger( 'click' );
+	} );
+
+	$( document ).on( 'change', '#bsm-import-file', function () {
+		var file = this.files && this.files[ 0 ];
+		if ( ! file ) return;
+
+		var reader = new FileReader();
+		reader.onload = function ( e ) {
+			state.importFileText = e.target.result;
+			ajax( 'bsm_preview_import', { post_id: state.postId, file_contents: state.importFileText }, function ( data ) {
+				renderImportPreview( data.groups );
+			}, function ( msg ) {
+				alert( 'Error: ' + msg );
+			} );
+		};
+		reader.readAsText( file );
+	} );
+
+	function containerRowsLine( c ) {
+		return c.current_count + ' existing row' + ( 1 === c.current_count ? '' : 's' ) +
+			' → ' + c.incoming_count + ' incoming row' + ( 1 === c.incoming_count ? '' : 's' ) + ' (replaces all rows in this field if checked)';
+	}
+
+	function containerPreviewHtml( c ) {
+		if ( ! c.preview || ! c.preview.length ) return '';
+		var html = '<div class="bsm-import-row-preview">';
+		c.preview.forEach( function ( row ) {
+			html += '<span class="bsm-card-tag">' + escapeHtml( row.title || '(empty)' ) + ( row.layout ? ' — ' + escapeHtml( row.layout ) : '' ) + '</span>';
+		} );
+		html += '</div>';
+		return html;
+	}
+
+	function renderImportPreview( groups ) {
+		var html = '';
+		var anyRows = false;
+
+		groups.forEach( function ( g ) {
+			html += '<div class="bsm-import-group"><h4>' + escapeHtml( g.group_title ) + '</h4>';
+
+			if ( ! g.found ) {
+				html += '<p class="bsm-error">Not found on this page — skipped.</p></div>';
+				return;
+			}
+
+			if ( ! g.leaves.length && ! g.containers.length ) {
+				html += '<p class="description">Nothing in this group to import.</p></div>';
+				return;
+			}
+
+			html += '<table class="bsm-import-table">';
+
+			g.leaves.forEach( function ( f ) {
+				if ( 'skip' === f.action ) {
+					html += '<tr class="bsm-import-skip"><td colspan="3">' + escapeHtml( f.label ) + ' — <em>' + escapeHtml( f.reason || 'Skipped' ) + '</em></td></tr>';
+					return;
+				}
+				anyRows = true;
+				var checked = 'leave' !== f.action ? ' checked' : '';
+				var actionLabel = { update: 'Will update', clear: 'Will clear', leave: 'No change (nothing to import)' }[ f.action ];
+				var incomingText = f.clear ? '(empty)' : ( 'image' === f.type ? ( f.incoming || '(empty)' ) : String( f.incoming || '(empty)' ) );
+				html += '<tr>';
+				html += '<td><label><input type="checkbox" class="bsm-import-field-cb" data-sig="' + escapeHtml( f.sig ) + '"' + checked + '> ' + escapeHtml( f.label ) + '</label></td>';
+				html += '<td class="description">' + escapeHtml( actionLabel ) + '</td>';
+				html += '<td class="description">' + escapeHtml( String( f.current || '(empty)' ) ) + ' → ' + escapeHtml( incomingText ) + '</td>';
+				html += '</tr>';
+			} );
+
+			g.containers.forEach( function ( c ) {
+				anyRows = true;
+				html += '<tr>';
+				html += '<td><label><input type="checkbox" class="bsm-import-field-cb" data-sig="' + escapeHtml( c.sig ) + '"> ' + escapeHtml( c.label ) + '</label></td>';
+				html += '<td class="description">' + escapeHtml( c.type ) + '</td>';
+				html += '<td class="description">' + escapeHtml( containerRowsLine( c ) ) + containerPreviewHtml( c ) + '</td>';
+				html += '</tr>';
+			} );
+
+			html += '</table></div>';
+		} );
+
+		if ( ! anyRows ) html += '<p class="description">Nothing importable was found in this file for this page.</p>';
+
+		$( '#bsm-import-diff' ).html( html );
+		$( '#bsm-import-result' ).empty();
+		$( '#bsm-import-review' ).show();
+		$( 'html, body' ).animate( { scrollTop: $( '#bsm-import-review' ).offset().top - 40 }, 200 );
+	}
+
+	$( document ).on( 'click', '#bsm-import-cancel', function () {
+		state.importFileText = null;
+		$( '#bsm-import-review' ).hide();
+		$( '#bsm-import-diff, #bsm-import-result' ).empty();
+	} );
+
+	$( document ).on( 'click', '#bsm-import-confirm', function () {
+		var included = [];
+		$( '.bsm-import-field-cb:checked' ).each( function () {
+			included.push( $( this ).data( 'sig' ) );
+		} );
+
+		if ( ! included.length ) {
+			alert( 'Nothing is checked — nothing would be imported.' );
+			return;
+		}
+
+		var $btn = $( this ).prop( 'disabled', true ).text( 'Importing…' );
+		ajax( 'bsm_commit_import', { post_id: state.postId, file_contents: state.importFileText, included: included }, function ( data ) {
+			var html = '<p class="bsm-success">Import complete.</p><ul>';
+			data.summary.forEach( function ( s ) {
+				html += '<li>' + escapeHtml( s.label ) + ' — ' + escapeHtml( s.status ) + ( s.reason ? ' (' + escapeHtml( s.reason ) + ')' : '' ) + '</li>';
+			} );
+			html += '</ul><p><button type="button" class="button button-primary" id="bsm-import-ok">OK</button></p>';
+
+			// The diff table and Cancel/Confirm no longer apply once it's actually been applied —
+			// swap them out for just the result + an OK button, instead of leaving the whole
+			// (now-stale) review sitting on screen taking up space until the page is reloaded.
+			$( '#bsm-import-diff, #bsm-import-review .bsm-actions' ).hide();
+			$( '#bsm-import-result' ).html( html );
+
+			// Refresh whatever's currently on screen so counts/values reflect the import immediately.
+			if ( state.groupKey ) loadFields();
+		}, function ( msg ) {
+			$( '#bsm-import-result' ).html( '<p class="bsm-error">' + escapeHtml( msg ) + '</p>' );
+			$btn.text( 'Confirm Import' ).prop( 'disabled', false );
+		} );
+	} );
+
+	$( document ).on( 'click', '#bsm-import-ok', function () {
+		state.importFileText = null;
+		$( '#bsm-import-review' ).hide();
+		$( '#bsm-import-diff, #bsm-import-result' ).empty();
+		$( '#bsm-import-review .bsm-actions' ).show(); // restored for the next time a file is loaded
+		$( '#bsm-import-confirm' ).text( 'Confirm Import' ).prop( 'disabled', false );
 	} );
 
 	/* ---------------- boot ---------------- */
